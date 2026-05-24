@@ -304,6 +304,149 @@ class TestStreamBuilderOperators:
         with pytest.raises(ValueError, match="non-empty sequence"):
             StreamBuilder().from_topic("in").cep([])
 
+    # ---- B-109 map_llm ----
+
+    def test_map_llm_minimal_shape(self) -> None:
+        b = StreamBuilder().from_topic("in").map_llm("Classify: {text}", output_field="sentiment")
+        assert b.operators() == [
+            {"type": "mapLlm", "prompt": "Classify: {text}", "outputField": "sentiment"}
+        ]
+
+    def test_map_llm_full_shape(self) -> None:
+        b = (
+            StreamBuilder()
+            .from_topic("in")
+            .map_llm(
+                "Summarise: {body}",
+                output_field="summary",
+                model="gemma3:7b",
+                temperature=0.0,
+                max_tokens=64,
+                parallelism=8,
+                ordering="UNORDERED",
+                on_failure="PASS_THROUGH",
+                max_calls_per_sec=50,
+            )
+        )
+        assert b.operators() == [
+            {
+                "type": "mapLlm",
+                "prompt": "Summarise: {body}",
+                "outputField": "summary",
+                "model": "gemma3:7b",
+                "temperature": 0.0,
+                "maxTokens": 64,
+                "parallelism": 8,
+                "ordering": "UNORDERED",
+                "onFailure": "PASS_THROUGH",
+                "maxCallsPerSec": 50,
+            }
+        ]
+
+    def test_map_llm_rejects_blank_prompt(self) -> None:
+        with pytest.raises(ValueError, match="prompt"):
+            StreamBuilder().from_topic("in").map_llm("", output_field="x")
+
+    def test_map_llm_rejects_blank_output_field(self) -> None:
+        with pytest.raises(ValueError, match="output_field"):
+            StreamBuilder().from_topic("in").map_llm("p", output_field="")
+
+    def test_map_llm_rejects_bad_ordering(self) -> None:
+        with pytest.raises(ValueError, match="ordering"):
+            StreamBuilder().from_topic("in").map_llm("p", output_field="o", ordering="SHUFFLED")
+
+    def test_map_llm_rejects_bad_on_failure(self) -> None:
+        with pytest.raises(ValueError, match="on_failure"):
+            StreamBuilder().from_topic("in").map_llm("p", output_field="o", on_failure="EXPLODE")
+
+    # ---- B-109 extract ----
+
+    def test_extract_full_shape(self) -> None:
+        b = (
+            StreamBuilder()
+            .from_topic("in")
+            .extract(
+                instruction="Extract the intent and urgency",
+                schema={"intent": "string", "urgency": "int"},
+                model="gemma3:7b",
+                temperature=0.0,
+            )
+        )
+        assert b.operators() == [
+            {
+                "type": "extract",
+                "instruction": "Extract the intent and urgency",
+                "schema": {"intent": "string", "urgency": "int"},
+                "model": "gemma3:7b",
+                "temperature": 0.0,
+            }
+        ]
+
+    def test_extract_rejects_blank_instruction(self) -> None:
+        with pytest.raises(ValueError, match="instruction"):
+            StreamBuilder().from_topic("in").extract(instruction="", schema={"a": "string"})
+
+    def test_extract_rejects_empty_schema(self) -> None:
+        with pytest.raises(ValueError, match="schema"):
+            StreamBuilder().from_topic("in").extract(instruction="x", schema={})
+
+    def test_extract_rejects_bad_on_failure(self) -> None:
+        with pytest.raises(ValueError, match="on_failure"):
+            StreamBuilder().from_topic("in").extract(
+                instruction="x", schema={"a": "string"}, on_failure="NOPE"
+            )
+
+    def test_llm_operators_chain_with_others(self) -> None:
+        # B-109 operators compose in the same chain as filter/map/window.
+        b = (
+            StreamBuilder()
+            .from_topic("tickets")
+            .map_llm("Summarise: {body}", output_field="summary")
+            .extract(instruction="Classify", schema={"urgency": "int"})
+            .filter("urgency >= 4")
+        )
+        types = [op["type"] for op in b.operators()]
+        assert types == ["mapLlm", "extract", "filter"]
+
+    # ---- B-109 Phase 2 mcp_call ----
+
+    def test_mcp_call_full_shape(self) -> None:
+        b = (
+            StreamBuilder()
+            .from_topic("in")
+            .mcp_call(
+                "crm.lookup_customer",
+                args={"customer_id": "{customerId}"},
+                output_field="customer",
+                parallelism=4,
+                ordering="UNORDERED",
+                on_failure="EMIT_ERROR",
+            )
+        )
+        assert b.operators() == [
+            {
+                "type": "mcpCall",
+                "tool": "crm.lookup_customer",
+                "args": {"customer_id": "{customerId}"},
+                "outputField": "customer",
+                "parallelism": 4,
+                "ordering": "UNORDERED",
+                "onFailure": "EMIT_ERROR",
+            }
+        ]
+
+    def test_mcp_call_minimal_fire_and_forget(self) -> None:
+        b = StreamBuilder().from_topic("in").mcp_call("pagerduty.create_incident")
+        assert b.operators() == [{"type": "mcpCall", "tool": "pagerduty.create_incident"}]
+
+    def test_mcp_call_rejects_blank_tool(self) -> None:
+        with pytest.raises(ValueError, match="tool"):
+            StreamBuilder().from_topic("in").mcp_call("")
+
+    def test_mcp_call_rejects_bad_on_failure(self) -> None:
+        with pytest.raises(ValueError, match="on_failure"):
+            StreamBuilder().from_topic("in").mcp_call("x", on_failure="NOPE")
+
     def test_broadcast_join_full_shape(self) -> None:
         b = (
             StreamBuilder()
