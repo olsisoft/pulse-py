@@ -28,7 +28,7 @@ from pulse_client.exceptions import (
 )
 
 DEFAULT_TIMEOUT = 30.0
-USER_AGENT = "pulse-client-python/2.5.8"
+USER_AGENT = "pulse-client-python/2.6.0"
 
 
 class PulseClient:
@@ -73,6 +73,12 @@ class PulseClient:
         self.templates = _TemplatesResource(self)
         self.users = _UsersResource(self)
         self.events = _EventsResource(self)
+        self.iq = _IQResource(self)
+        # Imported locally to avoid an import cycle (streams imports
+        # PulseClient only at type-check time via TYPE_CHECKING).
+        from pulse_client.streams import StreamsResource
+
+        self.streams = StreamsResource(self)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -137,7 +143,9 @@ class PulseClient:
                 raise PulseAuthError(
                     status_code=401,
                     path=path,
-                    body={"error": "No token set. Call client.auth.login() first or pass token=..."},
+                    body={
+                        "error": "No token set. Call client.auth.login() first or pass token=..."
+                    },
                 )
             headers["Authorization"] = f"Bearer {self._token}"
 
@@ -316,7 +324,7 @@ class _PipelinesResource(_Resource):
 
 
 class _AgentsResource(_Resource):
-    """``client.agents`` — inspect deployed agents (read-only)."""
+    """``client.agents`` — list / get / update / delete deployed agents."""
 
     def list(self) -> list[dict[str, Any]]:
         """GET /api/pulse/agents — every deployed agent in the current org."""
@@ -333,6 +341,39 @@ class _AgentsResource(_Resource):
             "dict[str, Any]",
             self._client._request("GET", f"/api/pulse/agents/{agent_id}"),
         )
+
+    def update(self, agent_id: str, config: dict[str, Any]) -> dict[str, Any]:
+        """B-115 Phase 1 — PUT /api/pulse/agents/{id}: replace the agent's config.
+
+        ``config`` is the FULL agent config (not a partial merge) — at minimum
+        ``name``; optional ``description`` / ``engineType`` / ``inputTopic`` /
+        ``outputTopic`` / ``instances`` / ``monthlyBudget`` / ``config`` fall
+        back to safe defaults when omitted. See the UpdateAgentRequest schema
+        in openapi.yaml.
+
+        Today this triggers a full stop + persist + start cycle on the engine
+        side — the agent is briefly unavailable while the swap happens.
+        Existing state in the agent's keyed store is preserved (the swap is
+        config-only). Phase 2 (B-115-engine) will add atomic event-boundary
+        swap so hot-reloadable changes apply with no downtime.
+
+        Returns the post-update agent snapshot (same shape as :meth:`get`).
+        Raises :class:`PulseValidationError` on a bad config (self-loop,
+        invalid streaming operators), :class:`PulseNotFoundError` if the
+        agent doesn't exist.
+        """
+        return cast(
+            "dict[str, Any]",
+            self._client._request("PUT", f"/api/pulse/agents/{agent_id}", json=config),
+        )
+
+    def delete(self, agent_id: str) -> None:
+        """DELETE /api/pulse/agents/{id} — stop the agent + remove its config row.
+
+        The agent's keyed state store is also dropped. Requires the
+        ``AGENT_DELETE`` permission.
+        """
+        self._client._request("DELETE", f"/api/pulse/agents/{agent_id}")
 
 
 class _TemplatesResource(_Resource):
@@ -363,6 +404,175 @@ class _UsersResource(_Resource):
             if isinstance(users, list):
                 return cast("list[dict[str, Any]]", users)
         return []
+
+
+class _IQResource(_Resource):
+    """``client.iq`` — B-106 Interactive Queries.
+
+    Live state of streaming agents, queryable like a database from any
+    microservice. Five operations against the engine's state store:
+
+    * :meth:`summary` — headline (size, backend, last checkpoint).
+    * :meth:`get` — point lookup at a key.
+    * :meth:`scan` — paginated range scan returning key/value pairs.
+    * :meth:`keys` — paginated range scan returning keys only.
+    * :meth:`query` — filtered / projected / grouped query.
+
+    The killer use case is a synchronous decision microservice (fraud,
+    rate-limit, pricing) that calls :meth:`get` on every request and
+    reads agent state from RAM with zero ingest-to-decision lag:
+
+        >>> with PulseClient(url, token=jwt) as client:
+        ...     state = client.iq.get("fraud-detector", "customer-42")
+        ...     if state["value"]["tx_count_60s"] > 5:
+        ...         deny_payment()
+
+    All endpoints require the ``AGENT_READ`` permission (Owner, Platform
+    Admin, Developer, Auditor personas by default — see B-105).
+
+    Server responses for ``state`` / ``scan`` / ``keys`` / ``query`` are
+    returned as raw dicts so callers can paginate, filter, and inspect
+    response metadata (``truncated``, ``limitApplied``, ``totalScanned``)
+    without going through a wrapper layer.
+    """
+
+    def summary(self, agent_id: str) -> dict[str, Any]:
+        """``GET /api/pulse/iq/agents/{id}/state`` — headline state summary.
+
+        Returns the IQSummary dict — fields ``agentId``, ``queryable``,
+        ``backend``, ``hotSize``, ``hotBytes``, ``coldSize``, ``coldBytes``,
+        ``lastCheckpointId``, ``totalSize``. All always present;
+        ``queryable=False`` when the agent has no live streaming backend.
+        """
+        path = f"/api/pulse/iq/agents/{_encode_path_segment(agent_id)}/state"
+        return cast("dict[str, Any]", self._client._request("GET", path))
+
+    def get(self, agent_id: str, key: str) -> dict[str, Any]:
+        """``GET /api/pulse/iq/agents/{id}/state/value/{key}`` — point lookup.
+
+        Returns an IQValue dict with fields ``agentId``, ``key``, ``value``.
+        ``value`` is the JSON-decoded payload; ``None`` is a legal value
+        (the server distinguishes "key present with null" from "key absent",
+        the latter raises :class:`PulseNotFoundError`).
+
+        Raises:
+            PulseNotFoundError: key absent OR agent not queryable. Check
+                ``e.body["error"]`` ("Key not found" vs "Agent has no
+                queryable state") to distinguish, and ``e.body["reason"]``
+                for the not-queryable cause.
+        """
+        path = (
+            f"/api/pulse/iq/agents/{_encode_path_segment(agent_id)}"
+            f"/state/value/{_encode_path_segment(key)}"
+        )
+        return cast("dict[str, Any]", self._client._request("GET", path))
+
+    def scan(
+        self,
+        agent_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """``GET /api/pulse/iq/agents/{id}/state/scan`` — paginated range scan.
+
+        Returns the IQScanResponse dict. Inspect ``truncated`` to decide if
+        there's more — if so, paginate by setting ``start`` to the last
+        returned key plus a sentinel suffix on the next call.
+
+        Args:
+            start: Inclusive lower bound on the key range; ``None`` = beginning.
+            end: Exclusive upper bound; ``None`` = end.
+            limit: Page size; server clamps to ``[1, 1000]``. Default 100.
+                If exceeded, the response also carries the
+                ``X-Pulse-Pagination-Clamped: true`` header (not surfaced
+                in the body — read via the underlying response if needed).
+
+        Raises:
+            PulseNotFoundError: agent not queryable.
+        """
+        path = f"/api/pulse/iq/agents/{_encode_path_segment(agent_id)}/state/scan"
+        return cast(
+            "dict[str, Any]",
+            self._client._request("GET", path, params=_iq_scan_params(start, end, limit)),
+        )
+
+    def list_keys(
+        self,
+        agent_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """``GET /api/pulse/iq/agents/{id}/state/keys`` — keys-only range scan.
+
+        Same shape as :meth:`scan` minus the values. Returns the
+        IQKeysResponse dict (``keys`` field is a list of strings).
+
+        Named ``list_keys`` (not ``keys``) to avoid shadowing the builtin
+        ``dict.keys`` semantics readers expect from the method name.
+        """
+        path = f"/api/pulse/iq/agents/{_encode_path_segment(agent_id)}/state/keys"
+        return cast(
+            "dict[str, Any]",
+            self._client._request("GET", path, params=_iq_scan_params(start, end, limit)),
+        )
+
+    def query(
+        self,
+        agent_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 100,
+        filter: dict[str, Any] | None = None,  # noqa: A002 - shadows builtin intentionally
+        projection: list[str] | None = None,
+        group_by: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /api/pulse/iq/agents/{id}/state/query`` — filtered / grouped query.
+
+        Args:
+            start, end, limit: Key-range + page-size, same as :meth:`scan`.
+            filter: Recursive filter expression. Leaf shape:
+                ``{"field": "name", "op": "eq|neq|gt|gte|lt|lte|exists|notexists|contains|in", "value": ...}``.
+                Compound: ``{"and": [...]}``, ``{"or": [...]}``, ``{"not": {...}}``.
+                Use ``"$value"`` as field to test the value itself (scalar states).
+                Each node must carry exactly ONE discriminator; mixing is a 400.
+            projection: When supplied, returned entries contain only these
+                fields (non-map values are returned unchanged).
+            group_by: Group entries by this field; switches the response
+                shape to IQQueryGroupedResponse (``groups`` array of
+                ``{groupKey, count}`` pairs).
+
+        Returns:
+            IQQueryFlatResponse if ``group_by`` is ``None``, else
+            IQQueryGroupedResponse. Inspect ``truncated`` + ``totalScanned``
+            (grouped queries cap scan at 100_000 keys).
+
+        Raises:
+            PulseValidationError: invalid filter syntax (HTTP 400 from server).
+            PulseNotFoundError: agent not queryable.
+        """
+        body: dict[str, Any] = {}
+        if start is not None:
+            body["start"] = start
+        if end is not None:
+            body["end"] = end
+        if limit != 100:
+            body["limit"] = limit
+        if filter is not None:
+            body["filter"] = filter
+        if projection is not None:
+            body["projection"] = projection
+        if group_by is not None:
+            body["groupBy"] = group_by
+        path = f"/api/pulse/iq/agents/{_encode_path_segment(agent_id)}/state/query"
+        return cast(
+            "dict[str, Any]",
+            self._client._request("POST", path, json=body if body else None),
+        )
 
 
 class _EventsResource(_Resource):
@@ -453,3 +663,40 @@ class _EventsResource(_Resource):
                 # Other SSE fields (`event:`, `id:`, `retry:`) are
                 # consumed but not surfaced — Pulse's server doesn't use
                 # them today. Add explicit dispatch when it does.
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (not part of the public API).
+# ---------------------------------------------------------------------------
+
+
+def _encode_path_segment(segment: str) -> str:
+    """URL-encodes a path segment so values containing ``/``, spaces, etc.
+    survive the round-trip to the server intact.
+
+    Used for agent ids + IQ keys. The server-side IQ handler explicitly
+    URL-decodes the key segment so operators can query, e.g.,
+    ``user:123/orders`` without the slash splitting the path.
+
+    We use :func:`urllib.parse.quote` with ``safe=""`` so that every
+    character outside the unreserved set is percent-encoded — including
+    ``/``, which is the whole point.
+    """
+    from urllib.parse import quote
+
+    return quote(segment, safe="")
+
+
+def _iq_scan_params(start: str | None, end: str | None, limit: int) -> dict[str, Any]:
+    """Builds the ``?start=&end=&limit=`` query dict for IQ scan/keys.
+
+    Skips keys that are ``None`` so the URL stays clean (httpx omits
+    None-valued params). ``limit`` is always sent (default 100, server
+    clamps to ``[1, 1000]``).
+    """
+    params: dict[str, Any] = {"limit": limit}
+    if start is not None:
+        params["start"] = start
+    if end is not None:
+        params["end"] = end
+    return params
