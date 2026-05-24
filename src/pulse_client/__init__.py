@@ -26,8 +26,15 @@ from pulse_client.exceptions import (
     PulseRateLimitError,
     PulseValidationError,
 )
+from pulse_client.streams import (
+    StreamBuilder,
+    StreamsResource,
+    WindowSpec,
+    aggs,
+    windows,
+)
 
-__version__ = "2.5.8"
+__version__ = "2.6.0"
 
 __all__ = [
     "PulseClient",
@@ -37,5 +44,10 @@ __all__ = [
     "PulseNotFoundError",
     "PulseRateLimitError",
     "PulseValidationError",
+    "StreamBuilder",
+    "StreamsResource",
+    "WindowSpec",
+    "aggs",
+    "windows",
     "__version__",
 ]

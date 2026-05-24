@@ -64,7 +64,7 @@ for agent in client.agents.list():
 client.close()
 ```
 
-## Supported surfaces (v2.5.8)
+## Supported surfaces (v2.6.0)
 
 | Resource | Methods | Notes |
 |---|---|---|

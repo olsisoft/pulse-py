@@ -34,9 +34,7 @@ class PulseAPIError(PulseClientError):
         super().__init__(message)
 
     @staticmethod
-    def _format_message(
-        status_code: int, path: str, body: dict[str, Any] | str | None
-    ) -> str:
+    def _format_message(status_code: int, path: str, body: dict[str, Any] | str | None) -> str:
         msg = f"HTTP {status_code} from {path}"
         if isinstance(body, dict):
             err = body.get("error") or body.get("errorMessage") or body.get("message")
