@@ -42,10 +42,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/olsisoft/streamflow"
-Documentation = "https://github.com/olsisoft/streamflow/blob/dev/pulse-py/README.md"
-Source = "https://github.com/olsisoft/streamflow/tree/dev/pulse-py"
-Issues = "https://github.com/olsisoft/streamflow/issues"
+Homepage = "https://github.com/olsisoft/pulse-py"
+Documentation = "https://github.com/olsisoft/pulse-py/blob/main/README.md"
+Source = "https://github.com/olsisoft/pulse-py/tree/main"
+Issues = "https://github.com/olsisoft/pulse-py/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulse_client"]
