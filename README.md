@@ -1,6 +1,6 @@
 # streamflow-pulse-client — Python SDK for StreamFlow Pulse
 
-Official Python client for the [Pulse](https://github.com/olsisoft/streamflow) AI Agent Platform.
+Official Python client for the [Pulse](https://github.com/olsisoft/pulse-py) AI Agent Platform.
 
 **Distribution name** on PyPI is `streamflow-pulse-client`; **import statement** stays the natural `from pulse_client import ...` (same convention as `python-dateutil` → `import dateutil`).
 
@@ -126,8 +126,8 @@ Every exception carries `.status_code`, `.path`, and `.body` so log lines + bug 
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-py
+git clone https://github.com/olsisoft/pulse-py.git
+cd pulse-py
 
 # Install in editable mode with dev deps
 pip install -e ".[dev]"
