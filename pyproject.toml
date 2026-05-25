@@ -30,10 +30,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# B-114 — duplex needs a WebSocket client. Optional so the core SDK stays
+# httpx-only; install with `pip install streamflow-pulse-client[duplex]`.
+duplex = [
+    "websockets>=12,<16",
+]
 test = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
+    "pytest-asyncio>=0.23",
     "respx>=0.21",
+    "websockets>=12,<16",
 ]
 dev = [
     "streamflow-pulse-client[test]",
@@ -42,10 +49,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/olsisoft/streamflow"
-Documentation = "https://github.com/olsisoft/streamflow/blob/dev/pulse-py/README.md"
-Source = "https://github.com/olsisoft/streamflow/tree/dev/pulse-py"
-Issues = "https://github.com/olsisoft/streamflow/issues"
+Homepage = "https://github.com/olsisoft/pulse-py"
+Documentation = "https://github.com/olsisoft/pulse-py/blob/main/README.md"
+Source = "https://github.com/olsisoft/pulse-py/tree/main"
+Issues = "https://github.com/olsisoft/pulse-py/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulse_client"]
@@ -53,6 +60,7 @@ packages = ["src/pulse_client"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --cov=pulse_client --cov-report=term-missing"
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
