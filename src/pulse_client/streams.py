@@ -468,6 +468,235 @@ class StreamBuilder:
         self._operators.append(op)
         return self
 
+    def map_llm(
+        self,
+        prompt: str,
+        *,
+        output_field: str,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        parallelism: int | None = None,
+        ordering: str | None = None,
+        on_failure: str | None = None,
+        max_calls_per_sec: int | None = None,
+    ) -> StreamBuilder:
+        """B-109 — enrich each event with an LLM completion.
+
+        ``prompt`` supports ``{field}`` placeholders substituted from the
+        event payload (and ``{__payload__}`` for the whole event JSON). The
+        completion text lands on the event under ``output_field``. Runs on
+        the Pulse engine — the LLM call is server-side, not in the client.
+
+        Args:
+            prompt: The prompt template. ``{field}`` placeholders resolve
+                against the event payload server-side.
+            output_field: Event field the completion text is written to.
+            model: LLM model id. ``None`` → the agent's configured default.
+            temperature / max_tokens: per-call LLM params.
+            parallelism: max concurrent LLM calls (AsyncIO knob).
+            ordering: ``"PRESERVE_INPUT"`` (default, ordered) or
+                ``"UNORDERED"`` (max throughput).
+            on_failure: ``"EMIT_ERROR"`` / ``"DROP"`` / ``"PASS_THROUGH"``.
+            max_calls_per_sec: cost guard-rail — caps LLM calls/sec.
+        """
+        _require_nonblank("prompt", prompt)
+        _require_nonblank("output_field", output_field)
+        if ordering is not None and ordering not in ("PRESERVE_INPUT", "UNORDERED"):
+            raise ValueError(f"ordering must be PRESERVE_INPUT or UNORDERED, got {ordering!r}")
+        if on_failure is not None and on_failure not in (
+            "EMIT_ERROR",
+            "DROP",
+            "PASS_THROUGH",
+        ):
+            raise ValueError(
+                f"on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {on_failure!r}"
+            )
+        op: dict[str, Any] = {
+            "type": "mapLlm",
+            "prompt": prompt,
+            "outputField": output_field,
+        }
+        if model is not None:
+            op["model"] = model
+        if temperature is not None:
+            op["temperature"] = temperature
+        if max_tokens is not None:
+            op["maxTokens"] = max_tokens
+        if parallelism is not None:
+            op["parallelism"] = parallelism
+        if ordering is not None:
+            op["ordering"] = ordering
+        if on_failure is not None:
+            op["onFailure"] = on_failure
+        if max_calls_per_sec is not None:
+            op["maxCallsPerSec"] = max_calls_per_sec
+        self._operators.append(op)
+        return self
+
+    def extract(
+        self,
+        *,
+        instruction: str,
+        schema: dict[str, str],
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        on_failure: str | None = None,
+    ) -> StreamBuilder:
+        """B-109 — LLM → typed structured fields merged into the event.
+
+        The LLM is asked to return a JSON object keyed by ``schema``'s field
+        names; the response is parsed and each field merged into the event.
+        Missing / malformed fields become ``None`` (the server never crashes
+        on a bad LLM response — downstream can branch on the null).
+
+        Args:
+            instruction: What to extract, in natural language.
+            schema: Mapping of output-field-name → type description
+                (e.g. ``{"intent": "string", "urgency": "int"}``). Must be
+                non-empty.
+            model / temperature / max_tokens: per-call LLM params.
+            on_failure: ``"EMIT_ERROR"`` / ``"DROP"`` / ``"PASS_THROUGH"``.
+        """
+        _require_nonblank("instruction", instruction)
+        if not schema:
+            raise ValueError("extract operator requires a non-empty schema")
+        if on_failure is not None and on_failure not in (
+            "EMIT_ERROR",
+            "DROP",
+            "PASS_THROUGH",
+        ):
+            raise ValueError(
+                f"on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {on_failure!r}"
+            )
+        op: dict[str, Any] = {
+            "type": "extract",
+            "instruction": instruction,
+            "schema": dict(schema),
+        }
+        if model is not None:
+            op["model"] = model
+        if temperature is not None:
+            op["temperature"] = temperature
+        if max_tokens is not None:
+            op["maxTokens"] = max_tokens
+        if on_failure is not None:
+            op["onFailure"] = on_failure
+        self._operators.append(op)
+        return self
+
+    def mcp_call(
+        self,
+        tool: str,
+        *,
+        args: dict[str, Any] | None = None,
+        output_field: str | None = None,
+        parallelism: int | None = None,
+        ordering: str | None = None,
+        on_failure: str | None = None,
+    ) -> StreamBuilder:
+        """B-109 Phase 2 — invoke an MCP tool per event.
+
+        Runs the named MCP tool on the Pulse engine, scoped to the agent's
+        org. ``args`` string values support ``{field}`` placeholder
+        substitution from the event payload. On success the tool's output is
+        written to ``output_field``; omit ``output_field`` for a
+        fire-and-forget side effect (the event passes through unchanged).
+
+        Args:
+            tool: The MCP tool name (e.g. ``"crm.lookup_customer"``).
+            args: Tool arguments. String values get ``{field}`` substitution.
+            output_field: Event field the tool output is written to. Omit for
+                fire-and-forget.
+            parallelism: max concurrent tool calls.
+            ordering: ``"PRESERVE_INPUT"`` (default) or ``"UNORDERED"``.
+            on_failure: ``"EMIT_ERROR"`` / ``"DROP"`` / ``"PASS_THROUGH"``.
+        """
+        _require_nonblank("tool", tool)
+        if ordering is not None and ordering not in ("PRESERVE_INPUT", "UNORDERED"):
+            raise ValueError(f"ordering must be PRESERVE_INPUT or UNORDERED, got {ordering!r}")
+        if on_failure is not None and on_failure not in (
+            "EMIT_ERROR",
+            "DROP",
+            "PASS_THROUGH",
+        ):
+            raise ValueError(
+                f"on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {on_failure!r}"
+            )
+        op: dict[str, Any] = {"type": "mcpCall", "tool": tool}
+        if args is not None:
+            op["args"] = dict(args)
+        if output_field is not None:
+            op["outputField"] = output_field
+        if parallelism is not None:
+            op["parallelism"] = parallelism
+        if ordering is not None:
+            op["ordering"] = ordering
+        if on_failure is not None:
+            op["onFailure"] = on_failure
+        self._operators.append(op)
+        return self
+
+    def ml_predict(
+        self,
+        *,
+        model: str,
+        input_fields: list[str],
+        output_field: str,
+        parallelism: int | None = None,
+        ordering: str | None = None,
+        on_failure: str | None = None,
+    ) -> StreamBuilder:
+        """B-112 — score each event with an embedded ML model.
+
+        Runs an uploaded ONNX model in-process on the Pulse engine (no
+        model-server hop). The named ``input_fields`` are pulled from the event
+        payload and fed to the model; the model's output is written as a nested
+        object under ``output_field`` so downstream operators can branch on it
+        (e.g. ``.filter("prediction.fraud_score > 0.8")``).
+
+        Upload the model first with :meth:`ModelsResource.upload`.
+
+        Args:
+            model: Registered model name (see ``client.models.upload``).
+            input_fields: Feature names pulled from the event, in the model's
+                input order. Dotted paths (``customer.tier``) resolve through
+                nested objects.
+            output_field: Event field the prediction object is written to.
+            parallelism: max concurrent inferences.
+            ordering: ``"PRESERVE_INPUT"`` (default) or ``"UNORDERED"``.
+            on_failure: ``"EMIT_ERROR"`` / ``"DROP"`` / ``"PASS_THROUGH"``.
+        """
+        _require_nonblank("model", model)
+        _require_nonblank("output_field", output_field)
+        if not input_fields or not all(isinstance(f, str) and f.strip() for f in input_fields):
+            raise ValueError("input_fields must be a non-empty list of non-blank strings")
+        if ordering is not None and ordering not in ("PRESERVE_INPUT", "UNORDERED"):
+            raise ValueError(f"ordering must be PRESERVE_INPUT or UNORDERED, got {ordering!r}")
+        if on_failure is not None and on_failure not in (
+            "EMIT_ERROR",
+            "DROP",
+            "PASS_THROUGH",
+        ):
+            raise ValueError(
+                f"on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {on_failure!r}"
+            )
+        op: dict[str, Any] = {
+            "type": "mlPredict",
+            "model": model,
+            "inputFields": list(input_fields),
+            "outputField": output_field,
+        }
+        if parallelism is not None:
+            op["parallelism"] = parallelism
+        if ordering is not None:
+            op["ordering"] = ordering
+        if on_failure is not None:
+            op["onFailure"] = on_failure
+        self._operators.append(op)
+        return self
+
     def broadcast_join(
         self,
         *,
@@ -556,6 +785,38 @@ class StreamBuilder:
         self._sink_config = dict(sink_config or {})
         self._sink_label = label
         return self
+
+    def to_connector(
+        self,
+        connector_type: str,
+        config: dict[str, Any] | None = None,
+        *,
+        topic: str | None = None,
+        label: str | None = None,
+    ) -> StreamBuilder:
+        """Terminate the stream in a connector sink (Segment, Kafka, Postgres, …).
+
+        Ergonomic, connector-first alias for
+        ``to_topic(topic, sink_channel=connector_type, sink_config=config)``:
+        the pipeline emits to an intermediate ``topic`` that the sink node then
+        delivers to the external system. Use a ``connector_type`` (subType) from
+        ``client.connectors.list()``; bridged connectors require the enterprise
+        bridge JAR on the server.
+
+        Args:
+            connector_type: Sink subType, e.g. ``"segment"``, ``"kafka"``,
+                ``"jdbc"``, ``"amplitude"``.
+            config: Connector config merged into the sink node (e.g.
+                ``{"segment.write.key": "wk_…"}``).
+            topic: Intermediate output topic; defaults to
+                ``"<connector_type>-sink-out"``.
+            label: Display label for the sink node.
+        """
+        _require_nonblank("connector_type", connector_type)
+        sink_topic = topic or f"{connector_type}-sink-out"
+        return self.to_topic(
+            sink_topic, sink_channel=connector_type, sink_config=config, label=label
+        )
 
     def to_state(self) -> StreamBuilder:
         """Terminate the stream in the agent's state store.
