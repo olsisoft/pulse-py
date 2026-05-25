@@ -397,10 +397,15 @@ def _apply_op(
         "cep",
         "broadcastJoin",
         "cdcJoin",
+        "mapLlm",
+        "extract",
+        "mcpCall",
+        "mlPredict",
     ):
         raise NotImplementedError(
-            f"simulate: operator {kind!r} not supported yet (Phase 1 supports "
-            f"filter, map, flat_map, key_by, window). Coming in Phase 2."
+            f"simulate: operator {kind!r} needs the live engine (LLM / MCP / ML / "
+            f"external lookup) and cannot run in local simulation. Local sim supports "
+            f"filter, map, flat_map, key_by, window."
         )
     raise ValueError(f"simulate: unknown operator type {kind!r}")
 

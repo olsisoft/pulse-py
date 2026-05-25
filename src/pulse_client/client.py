@@ -74,6 +74,7 @@ class PulseClient:
         self.users = _UsersResource(self)
         self.events = _EventsResource(self)
         self.iq = _IQResource(self)
+        self.models = _ModelsResource(self)
         # Imported locally to avoid an import cycle (streams imports
         # PulseClient only at type-check time via TYPE_CHECKING).
         from pulse_client.streams import StreamsResource
@@ -111,6 +112,32 @@ class PulseClient:
             self._request("GET", "/api/pulse/version", authenticated=False),
         )
 
+    def duplex(self, agent_id: str, *, ws_url: str | None = None) -> Any:
+        """B-114 — open a bidirectional duplex channel to an agent.
+
+        Returns an async context manager (:class:`~pulse_client._duplex.DuplexChannel`)
+        that streams events IN and receives the agent's correlated outputs OUT
+        on a single WebSocket — the synchronous-decision path (fraud, pricing,
+        A/B assignment). Requires the ``[duplex]`` extra
+        (``pip install streamflow-pulse-client[duplex]``).
+
+        The endpoint runs on the Pulse WebSocket port (REST port + 1); pass
+        ``ws_url`` to override the derived URL.
+
+        Example::
+
+            async with client.duplex("fraud-detector") as ch:
+                await ch.send({"amount": 5000}, correlation_id="tx-1")
+                signal = await ch.recv()
+                # signal["correlation_id"] == "tx-1"
+        """
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string")
+        from pulse_client._duplex import DuplexChannel, derive_ws_url
+
+        url = ws_url or derive_ws_url(self._base_url, agent_id, self._token)
+        return DuplexChannel(url)
+
     @property
     def token(self) -> str | None:
         """The currently-set bearer token, if any."""
@@ -130,12 +157,16 @@ class PulseClient:
         *,
         json: Any = None,
         params: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
         authenticated: bool = True,
     ) -> Any:
         """Issues an HTTP request and translates errors to typed exceptions.
 
         Returns the parsed JSON body for 2xx responses, or ``None`` for
-        204 No Content.
+        204 No Content. When ``files`` is given the request is sent as
+        ``multipart/form-data`` (with optional ``data`` form fields) instead of
+        a JSON body — used by the model-upload endpoint.
         """
         headers: dict[str, str] = {}
         if authenticated:
@@ -152,8 +183,10 @@ class PulseClient:
         response = self._http.request(
             method,
             path,
-            json=json,
+            json=json if files is None else None,
             params=params,
+            files=files,
+            data=data,
             headers=headers,
         )
 
@@ -387,6 +420,110 @@ class _TemplatesResource(_Resource):
             if isinstance(templates, list):
                 return cast("list[dict[str, Any]]", templates)
         return []
+
+
+class _ModelsResource(_Resource):
+    """``client.models`` — B-112 embedded ML model registry.
+
+    Upload ONNX models that the streaming ``ml_predict`` operator scores events
+    against, in-process on the Pulse engine (no model-server hop). Models are
+    org-scoped; upload / delete require the ADMIN role.
+
+    Example:
+        >>> client.models.upload(
+        ...     name="fraud-classifier",
+        ...     path="./model.onnx",
+        ...     input_schema={"amount": "float", "country": "string"},
+        ...     output_schema={"fraud_score": "float", "label": "string"},
+        ... )
+        >>> builder.from_topic("transactions").ml_predict(
+        ...     model="fraud-classifier",
+        ...     input_fields=["amount", "country"],
+        ...     output_field="prediction",
+        ... ).to_topic("scored")
+    """
+
+    def upload(
+        self,
+        *,
+        name: str,
+        path: str | None = None,
+        data: bytes | None = None,
+        runtime: str = "onnx",
+        input_schema: dict[str, str] | None = None,
+        output_schema: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/pulse/ml-models — upload (or replace) a model.
+
+        Supply the model either by file ``path`` or raw ``data`` bytes.
+        ``input_schema`` (feature-name → type, in the model's input order) is
+        used to pack features into the model's input tensor; ``output_schema``
+        is informational. Replacing an existing name hot-swaps the model with
+        no agent restart.
+
+        Args:
+            name: Model name referenced by ``ml_predict(model=...)``.
+            path: Filesystem path to the ``.onnx`` file.
+            data: Raw model bytes (alternative to ``path``).
+            runtime: Model runtime — only ``"onnx"`` is supported today.
+            input_schema: Ordered feature-name → type map.
+            output_schema: Output-name → type map (informational).
+
+        Returns:
+            The persisted model metadata (name, runtime, sha256, version, …).
+        """
+        _require_nonblank_models("name", name)
+        if (path is None) == (data is None):
+            raise ValueError("provide exactly one of 'path' or 'data'")
+        if path is not None:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            filename = path.rsplit("/", 1)[-1]
+        else:
+            blob = data  # type: ignore[assignment]
+            filename = f"{name}.onnx"
+        if not blob:
+            raise ValueError("model bytes are empty")
+
+        form: dict[str, Any] = {"name": name, "runtime": runtime}
+        if input_schema is not None:
+            form["inputSchema"] = json.dumps(input_schema)
+        if output_schema is not None:
+            form["outputSchema"] = json.dumps(output_schema)
+        files = {"model": (filename, blob, "application/octet-stream")}
+        return cast(
+            "dict[str, Any]",
+            self._client._request(
+                "POST", "/api/pulse/ml-models", files=files, data=form
+            ),
+        )
+
+    def list(self) -> list[dict[str, Any]]:
+        """GET /api/pulse/ml-models — models registered for the caller's org."""
+        result = self._client._request("GET", "/api/pulse/ml-models")
+        if isinstance(result, dict):
+            models = result.get("models", [])
+            if isinstance(models, list):
+                return cast("list[dict[str, Any]]", models)
+        return []
+
+    def get(self, name: str) -> dict[str, Any]:
+        """GET /api/pulse/ml-models/{name} — metadata for one model."""
+        _require_nonblank_models("name", name)
+        return cast(
+            "dict[str, Any]",
+            self._client._request("GET", f"/api/pulse/ml-models/{name}"),
+        )
+
+    def delete(self, name: str) -> None:
+        """DELETE /api/pulse/ml-models/{name} — remove a model (ADMIN)."""
+        _require_nonblank_models("name", name)
+        self._client._request("DELETE", f"/api/pulse/ml-models/{name}")
+
+
+def _require_nonblank_models(field: str, value: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
 
 
 class _UsersResource(_Resource):

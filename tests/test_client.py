@@ -322,6 +322,86 @@ class TestTemplates:
         assert templates[0]["id"] == "fraud-detection"
 
 
+class TestModels:
+    """B-112 — client.models (embedded ML model registry)."""
+
+    @respx.mock
+    def test_upload_from_bytes_sends_multipart(
+        self, authed_client: PulseClient, base_url: str
+    ) -> None:
+        route = respx.post(f"{base_url}/api/pulse/ml-models").mock(
+            return_value=httpx.Response(
+                201,
+                json={"name": "fraud", "runtime": "onnx", "version": 1, "sizeBytes": 5},
+            )
+        )
+        meta = authed_client.models.upload(
+            name="fraud",
+            data=b"\x08\x09onnx",
+            input_schema={"amount": "float"},
+            output_schema={"score": "float"},
+        )
+        assert meta["name"] == "fraud"
+        assert route.called
+        sent = route.calls.last.request
+        body = sent.content
+        # multipart body carries the form fields + the file part
+        assert b"multipart/form-data" in sent.headers["content-type"].encode()
+        assert b'name="name"' in body
+        assert b"fraud" in body
+        assert b'name="inputSchema"' in body
+        assert b'name="model"' in body  # the file part
+
+    @respx.mock
+    def test_upload_from_path(
+        self, authed_client: PulseClient, base_url: str, tmp_path
+    ) -> None:
+        model_file = tmp_path / "m.onnx"
+        model_file.write_bytes(b"onnxbytes")
+        respx.post(f"{base_url}/api/pulse/ml-models").mock(
+            return_value=httpx.Response(201, json={"name": "m", "version": 1})
+        )
+        meta = authed_client.models.upload(name="m", path=str(model_file))
+        assert meta["name"] == "m"
+
+    def test_upload_requires_exactly_one_source(self, authed_client: PulseClient) -> None:
+        with pytest.raises(ValueError, match="exactly one"):
+            authed_client.models.upload(name="m")  # neither path nor data
+        with pytest.raises(ValueError, match="exactly one"):
+            authed_client.models.upload(name="m", path="x", data=b"y")
+
+    def test_upload_rejects_empty_bytes(self, authed_client: PulseClient) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            authed_client.models.upload(name="m", data=b"")
+
+    def test_upload_rejects_blank_name(self, authed_client: PulseClient) -> None:
+        with pytest.raises(ValueError, match="name"):
+            authed_client.models.upload(name="  ", data=b"x")
+
+    @respx.mock
+    def test_list_unwraps_envelope(self, authed_client: PulseClient, base_url: str) -> None:
+        respx.get(f"{base_url}/api/pulse/ml-models").mock(
+            return_value=httpx.Response(200, json={"models": [{"name": "fraud"}]})
+        )
+        models = authed_client.models.list()
+        assert models[0]["name"] == "fraud"
+
+    @respx.mock
+    def test_get_returns_metadata(self, authed_client: PulseClient, base_url: str) -> None:
+        respx.get(f"{base_url}/api/pulse/ml-models/fraud").mock(
+            return_value=httpx.Response(200, json={"name": "fraud", "version": 2})
+        )
+        assert authed_client.models.get("fraud")["version"] == 2
+
+    @respx.mock
+    def test_delete(self, authed_client: PulseClient, base_url: str) -> None:
+        route = respx.delete(f"{base_url}/api/pulse/ml-models/fraud").mock(
+            return_value=httpx.Response(200, json={"deleted": "fraud"})
+        )
+        authed_client.models.delete("fraud")
+        assert route.called
+
+
 class TestEventsStream:
     """B-098 Phase 7 — SSE event-stream consumer."""
 

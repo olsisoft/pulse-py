@@ -1,6 +1,6 @@
 # streamflow-pulse-client — Python SDK for StreamFlow Pulse
 
-Official Python client for the [Pulse](https://github.com/olsisoft/streamflow) AI Agent Platform.
+Official Python client for the [Pulse](https://github.com/olsisoft/pulse-py) AI Agent Platform.
 
 **Distribution name** on PyPI is `streamflow-pulse-client`; **import statement** stays the natural `from pulse_client import ...` (same convention as `python-dateutil` → `import dateutil`).
 
@@ -77,6 +77,27 @@ client.close()
 
 The full ~112-endpoint surface (admin, audit, backups, chat, workspace, etc.) is documented in the OpenAPI spec at `<pulse-server>/api-docs`. SDK methods for those land opportunistically as user-facing demand surfaces.
 
+## Embedded ML inference & duplex
+
+Score events with an uploaded ONNX model in-process (B-112), and open a
+bidirectional duplex channel for synchronous decisions (B-114). Full guide:
+[ML inference & duplex](https://github.com/olsisoft/pulse-py/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+
+```python
+# Upload + score with an ONNX model (no model-server hop)
+client.models.upload(name="fraud", path="./fraud.onnx",
+                     input_schema={"amount": "float", "country": "float"})
+builder.from_topic("transactions").ml_predict(
+    model="fraud", input_fields=["amount", "country"], output_field="prediction"
+).filter("prediction.fraud_score > 0.8").to_topic("flagged")
+
+# Duplex: send in, receive the correlated output on one connection
+# (pip install streamflow-pulse-client[duplex])
+async with client.duplex("fraud-detector") as ch:
+    await ch.send({"amount": 5000}, correlation_id="tx-1")
+    signal = await ch.recv()        # signal["correlation_id"] == "tx-1"
+```
+
 ## Authentication
 
 Three patterns, pick what fits:
@@ -126,8 +147,8 @@ Every exception carries `.status_code`, `.path`, and `.body` so log lines + bug 
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-py
+git clone https://github.com/olsisoft/pulse-py.git
+cd pulse-py
 
 # Install in editable mode with dev deps
 pip install -e ".[dev]"
