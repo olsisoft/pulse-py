@@ -46,7 +46,7 @@ _PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 def _python_snippets() -> list[tuple[str, int, str]]:
     """(filename, 1-based block index, code) for every python fence."""
     if not _DOCS_DIR.is_dir():
-        pytest.skip(f"developer-hub docs not found at {_DOCS_DIR}")
+        pytest.skip(f"developer-hub docs not found at {_DOCS_DIR}", allow_module_level=True)
     out: list[tuple[str, int, str]] = []
     for md in sorted(_DOCS_DIR.glob("*.md")):
         for i, m in enumerate(_PYTHON_BLOCK.finditer(md.read_text(encoding="utf-8")), 1):
