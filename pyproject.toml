@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "streamflow-pulse-client"
-version = "2.6.1"
+version = "2.7.8"
 description = "Official Python client for StreamFlow Pulse — AI Agent Platform"
 readme = "README.md"
 license = {text = "Apache-2.0"}
