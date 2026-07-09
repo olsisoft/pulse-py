@@ -21,6 +21,7 @@ from pulse_client import (
     PulseRateLimitError,
     PulseValidationError,
 )
+from pulse_client.client import _validate_wasm_module
 
 
 class TestClientLifecycle:
@@ -77,7 +78,7 @@ class TestAuth:
             return_value=httpx.Response(
                 200,
                 json={
-                    "token": "new.jwt.token",
+                    "accessToken": "new.jwt.token",
                     "refreshToken": "refresh.token",
                     "activeOrg": {"id": "org1", "name": "Acme"},
                 },
@@ -170,6 +171,32 @@ class TestPipelines:
         )
         with pytest.raises(PulseNotFoundError):
             authed_client.pipelines.get("nope")
+
+    @respx.mock
+    def test_pipeline_id_with_special_chars_is_url_encoded(
+        self, authed_client: PulseClient, base_url: str
+    ) -> None:
+        # S3 — a pipeline/agent id containing '/', spaces or '#' must be
+        # percent-encoded into a single path segment. Before the fix these
+        # were interpolated raw, so an id like "team/orders" split the path
+        # and hit the wrong (or a 404) route. The server URL-decodes the
+        # segment back to the original id.
+        route = respx.get(f"{base_url}/api/pulse/pipelines/team%2Forders%20v2").mock(
+            return_value=httpx.Response(200, json={"id": "team/orders v2", "nodes": []})
+        )
+        result = authed_client.pipelines.get("team/orders v2")
+        assert route.called
+        assert result["id"] == "team/orders v2"
+
+    @respx.mock
+    def test_agent_id_with_special_chars_is_url_encoded(
+        self, authed_client: PulseClient, base_url: str
+    ) -> None:
+        route = respx.delete(f"{base_url}/api/pulse/agents/a%23b%2Fc").mock(
+            return_value=httpx.Response(204)
+        )
+        authed_client.agents.delete("a#b/c")
+        assert route.called
 
     @respx.mock
     def test_create_returns_created_pipeline(
@@ -399,6 +426,137 @@ class TestModels:
             return_value=httpx.Response(200, json={"deleted": "fraud"})
         )
         authed_client.models.delete("fraud")
+        assert route.called
+
+
+# A minimal conforming sandbox module: magic/version + an export section that
+# exports alloc / process / memory and imports nothing. (3 exports; the count
+# prefix byte is 0x03.)
+_VALID_WASM = bytes.fromhex(
+    "0061736d01000000"  # magic + version
+    "071c"  # export section id=7, size=0x1c
+    "03"  # export count = 3
+    "05616c6c6f630000"  # "alloc" kind=func index=0
+    "0770726f636573730000"  # "process" kind=func index=0
+    "066d656d6f72790200"  # "memory" kind=mem index=0
+)
+
+# Same as _VALID_WASM but with an import section (id=2) declaring 1 host import
+# ("env"."f"). Must be rejected even though the exports are present.
+_IMPORT_WASM = bytes.fromhex(
+    "0061736d01000000"  # magic + version
+    "02090103656e7601660000"  # import section: count=1, "env"."f" func type 0
+    "071c"  # export section
+    "03"  # export count = 3
+    "05616c6c6f630000"
+    "0770726f636573730000"
+    "066d656d6f72790200"
+)
+
+# An export section that lists only "alloc" — missing process/memory.
+_MISSING_EXPORT_WASM = bytes.fromhex(
+    "0061736d01000000"  # magic + version
+    "0709"  # export section id=7, size=9
+    "01"  # export count = 1
+    "05616c6c6f630000"  # "alloc" kind=func index=0
+)
+
+
+class TestWasmValidation:
+    """Client-side pre-upload validation of WASM module bytes."""
+
+    def test_valid_module_passes(self) -> None:
+        # Must not raise.
+        _validate_wasm_module(_VALID_WASM)
+
+    def test_empty_bytes_rejected(self) -> None:
+        with pytest.raises(ValueError, match="too short"):
+            _validate_wasm_module(b"")
+
+    def test_too_short_rejected(self) -> None:
+        with pytest.raises(ValueError, match="too short"):
+            _validate_wasm_module(b"\x00asm")
+
+    def test_bad_magic_rejected(self) -> None:
+        bad = b"\x01" + _VALID_WASM[1:]  # flip first byte
+        with pytest.raises(ValueError, match="bad magic/version"):
+            _validate_wasm_module(bad)
+
+    def test_host_import_rejected(self) -> None:
+        with pytest.raises(ValueError, match="imports host functions"):
+            _validate_wasm_module(_IMPORT_WASM)
+
+    def test_missing_export_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must export alloc, process and memory"):
+            _validate_wasm_module(_MISSING_EXPORT_WASM)
+
+    def test_truncated_module_rejected(self) -> None:
+        # A declared section larger than the remaining bytes => malformed.
+        truncated = b"\x00asm\x01\x00\x00\x00" + bytes([7, 0x7F])
+        with pytest.raises(ValueError, match="malformed WASM module"):
+            _validate_wasm_module(truncated)
+
+
+class TestWasm:
+    """B-110 — client.wasm (sandboxed WASM module registry)."""
+
+    @respx.mock
+    def test_upload_from_bytes_sends_multipart(
+        self, authed_client: PulseClient, base_url: str
+    ) -> None:
+        route = respx.post(f"{base_url}/api/pulse/wasm-modules").mock(
+            return_value=httpx.Response(201, json={"name": "redactor", "version": 1, "sizeBytes": 9})
+        )
+        meta = authed_client.wasm.upload(
+            name="redactor", data=_VALID_WASM, description="pii"
+        )
+        assert meta["name"] == "redactor"
+        assert route.called
+        sent = route.calls.last.request
+        assert b"multipart/form-data" in sent.headers["content-type"].encode()
+        assert b'name="name"' in sent.content
+        assert b'name="module"' in sent.content  # the file part
+
+    def test_upload_requires_exactly_one_source(self, authed_client: PulseClient) -> None:
+        with pytest.raises(ValueError, match="exactly one"):
+            authed_client.wasm.upload(name="m")
+        with pytest.raises(ValueError, match="exactly one"):
+            authed_client.wasm.upload(name="m", path="x", data=b"y")
+
+    def test_upload_rejects_empty_bytes(self, authed_client: PulseClient) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            authed_client.wasm.upload(name="m", data=b"")
+
+    @respx.mock
+    def test_upload_rejects_bad_module_without_hitting_server(
+        self, authed_client: PulseClient, base_url: str
+    ) -> None:
+        # A non-conforming module must be rejected client-side, BEFORE the
+        # HTTP round-trip — the route must record zero calls.
+        route = respx.post(f"{base_url}/api/pulse/wasm-modules").mock(
+            return_value=httpx.Response(201, json={"name": "x"})
+        )
+        with pytest.raises(ValueError, match="bad magic/version"):
+            authed_client.wasm.upload(name="x", data=b"not-a-wasm-module")
+        assert not route.called
+
+    @respx.mock
+    def test_list_unwraps_envelope(self, authed_client: PulseClient, base_url: str) -> None:
+        respx.get(f"{base_url}/api/pulse/wasm-modules").mock(
+            return_value=httpx.Response(200, json={"modules": [{"name": "redactor"}]})
+        )
+        assert authed_client.wasm.list()[0]["name"] == "redactor"
+
+    @respx.mock
+    def test_get_and_delete(self, authed_client: PulseClient, base_url: str) -> None:
+        respx.get(f"{base_url}/api/pulse/wasm-modules/redactor").mock(
+            return_value=httpx.Response(200, json={"name": "redactor", "version": 2})
+        )
+        assert authed_client.wasm.get("redactor")["version"] == 2
+        route = respx.delete(f"{base_url}/api/pulse/wasm-modules/redactor").mock(
+            return_value=httpx.Response(200, json={"deleted": "redactor"})
+        )
+        authed_client.wasm.delete("redactor")
         assert route.called
 
 
