@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import builtins
 import json
+import random
+import time
 from collections.abc import Iterator
 from types import TracebackType
 from typing import Any, cast
@@ -29,7 +31,13 @@ from pulse_client.exceptions import (
 )
 
 DEFAULT_TIMEOUT = 30.0
-USER_AGENT = "pulse-client-python/2.6.1"
+USER_AGENT = "pulse-client-python/2.7.9"
+
+# HTTP methods that are safe to retry on a transient 5xx / transport error
+# (the request either has no side effect or is idempotent). 429 (rate-limited)
+# is always safe to retry regardless of method — the request was rejected, not
+# processed — so it is handled separately.
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 
 
 class PulseClient:
@@ -58,9 +66,33 @@ class PulseClient:
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         verify: bool | str = True,
+        max_retries: int = 0,
+        retry_backoff: float = 0.2,
+        retry_max_backoff: float = 10.0,
+        retry_on_status: tuple[int, ...] = (502, 503, 504),
+        retry_idempotent_only: bool = True,
     ) -> None:
+        """Construct a client.
+
+        Retries are **opt-in and off by default** (``max_retries=0``). When
+        ``max_retries > 0`` the client retries transient failures with bounded,
+        full-jitter exponential backoff:
+
+        * **429 (rate limited)** is always retried (the request was rejected,
+          never processed) and honours ``retryAfterSeconds`` / the ``Retry-After``
+          header before falling back to backoff;
+        * ``retry_on_status`` 5xx and transport (connect/read) errors are retried
+          only for idempotent methods (GET/HEAD/PUT/DELETE/OPTIONS) unless
+          ``retry_idempotent_only=False`` — so a POST create is never silently
+          duplicated by a retry.
+        """
         self._base_url = base_url.rstrip("/")
         self._token = token
+        self._max_retries = max(0, max_retries)
+        self._retry_backoff = retry_backoff
+        self._retry_max_backoff = retry_max_backoff
+        self._retry_on_status = tuple(retry_on_status)
+        self._retry_idempotent_only = retry_idempotent_only
         self._http = httpx.Client(
             base_url=self._base_url,
             timeout=timeout,
@@ -76,6 +108,7 @@ class PulseClient:
         self.events = _EventsResource(self)
         self.iq = _IQResource(self)
         self.models = _ModelsResource(self)
+        self.wasm = _WasmResource(self)
         self.connectors = _ConnectorsResource(self)
         # Imported locally to avoid an import cycle (streams imports
         # PulseClient only at type-check time via TYPE_CHECKING).
@@ -152,6 +185,11 @@ class PulseClient:
     # ------------------------------------------------------------------
     # Internal: request execution + error translation
     # ------------------------------------------------------------------
+    def _backoff_delay(self, attempt: int) -> float:
+        """Full-jitter exponential backoff: uniform(0, min(max, base * 2**attempt))."""
+        ceiling = min(self._retry_max_backoff, self._retry_backoff * (2 ** attempt))
+        return random.uniform(0.0, max(0.0, ceiling))
+
     def _request(
         self,
         method: str,
@@ -163,7 +201,63 @@ class PulseClient:
         data: dict[str, Any] | None = None,
         authenticated: bool = True,
     ) -> Any:
-        """Issues an HTTP request and translates errors to typed exceptions.
+        """Opt-in retry wrapper around :meth:`_send_once` (off by default).
+
+        See :meth:`__init__` for the policy. A no-retry client (``max_retries=0``)
+        makes exactly one attempt — identical to the pre-retry behaviour.
+        """
+        idempotent = method.upper() in _IDEMPOTENT_METHODS
+        attempt = 0
+        while True:
+            try:
+                return self._send_once(
+                    method, path, json=json, params=params,
+                    files=files, data=data, authenticated=authenticated,
+                )
+            except PulseRateLimitError as exc:
+                # 429: rejected, never processed → always safe to retry; honour Retry-After.
+                if attempt >= self._max_retries:
+                    raise
+                delay = (
+                    float(exc.retry_after_seconds)
+                    if exc.retry_after_seconds is not None
+                    else self._backoff_delay(attempt)
+                )
+                time.sleep(max(0.0, delay))
+            except PulseAPIError as exc:
+                # Transient 5xx (PulseRateLimitError already handled above) — retry only
+                # for idempotent methods unless explicitly opted out. 401/404/400 have
+                # statuses outside retry_on_status → re-raised here.
+                retryable = (
+                    attempt < self._max_retries
+                    and exc.status_code in self._retry_on_status
+                    and (idempotent or not self._retry_idempotent_only)
+                )
+                if not retryable:
+                    raise
+                time.sleep(self._backoff_delay(attempt))
+            except httpx.TransportError:
+                retryable = (
+                    attempt < self._max_retries
+                    and (idempotent or not self._retry_idempotent_only)
+                )
+                if not retryable:
+                    raise
+                time.sleep(self._backoff_delay(attempt))
+            attempt += 1
+
+    def _send_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        authenticated: bool = True,
+    ) -> Any:
+        """Issues a single HTTP request and translates errors to typed exceptions.
 
         Returns the parsed JSON body for 2xx responses, or ``None`` for
         204 No Content. When ``files`` is given the request is sent as
@@ -271,7 +365,7 @@ class _AuthResource(_Resource):
                 authenticated=False,
             ),
         )
-        token = response.get("token") if isinstance(response, dict) else None
+        token = (response.get("accessToken") or response.get("token")) if isinstance(response, dict) else None
         if token:
             self._client.token = token
         return response
@@ -290,7 +384,7 @@ class _AuthResource(_Resource):
                 authenticated=False,
             ),
         )
-        token = response.get("token") if isinstance(response, dict) else None
+        token = (response.get("accessToken") or response.get("token")) if isinstance(response, dict) else None
         if token:
             self._client.token = token
         return response
@@ -317,7 +411,7 @@ class _AuthResource(_Resource):
                 json={"orgId": org_id},
             ),
         )
-        token = response.get("token") if isinstance(response, dict) else None
+        token = (response.get("accessToken") or response.get("token")) if isinstance(response, dict) else None
         if token:
             self._client.token = token
         return response
@@ -339,7 +433,7 @@ class _PipelinesResource(_Resource):
         """GET /api/pulse/pipelines/{id} — one pipeline by id."""
         return cast(
             "dict[str, Any]",
-            self._client._request("GET", f"/api/pulse/pipelines/{pipeline_id}"),
+            self._client._request("GET", f"/api/pulse/pipelines/{_encode_path_segment(pipeline_id)}"),
         )
 
     def create(self, definition: dict[str, Any]) -> dict[str, Any]:
@@ -355,7 +449,7 @@ class _PipelinesResource(_Resource):
 
     def delete(self, pipeline_id: str) -> None:
         """DELETE /api/pulse/pipelines/{id} — tears down the pipeline."""
-        self._client._request("DELETE", f"/api/pulse/pipelines/{pipeline_id}")
+        self._client._request("DELETE", f"/api/pulse/pipelines/{_encode_path_segment(pipeline_id)}")
 
 
 class _AgentsResource(_Resource):
@@ -374,7 +468,7 @@ class _AgentsResource(_Resource):
         """GET /api/pulse/agents/{id} — one agent by id."""
         return cast(
             "dict[str, Any]",
-            self._client._request("GET", f"/api/pulse/agents/{agent_id}"),
+            self._client._request("GET", f"/api/pulse/agents/{_encode_path_segment(agent_id)}"),
         )
 
     def update(self, agent_id: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -399,7 +493,7 @@ class _AgentsResource(_Resource):
         """
         return cast(
             "dict[str, Any]",
-            self._client._request("PUT", f"/api/pulse/agents/{agent_id}", json=config),
+            self._client._request("PUT", f"/api/pulse/agents/{_encode_path_segment(agent_id)}", json=config),
         )
 
     def delete(self, agent_id: str) -> None:
@@ -408,7 +502,7 @@ class _AgentsResource(_Resource):
         The agent's keyed state store is also dropped. Requires the
         ``AGENT_DELETE`` permission.
         """
-        self._client._request("DELETE", f"/api/pulse/agents/{agent_id}")
+        self._client._request("DELETE", f"/api/pulse/agents/{_encode_path_segment(agent_id)}")
 
 
 class _TemplatesResource(_Resource):
@@ -550,18 +644,178 @@ class _ModelsResource(_Resource):
         _require_nonblank_models("name", name)
         return cast(
             "dict[str, Any]",
-            self._client._request("GET", f"/api/pulse/ml-models/{name}"),
+            self._client._request("GET", f"/api/pulse/ml-models/{_encode_path_segment(name)}"),
         )
 
     def delete(self, name: str) -> None:
         """DELETE /api/pulse/ml-models/{name} — remove a model (ADMIN)."""
         _require_nonblank_models("name", name)
-        self._client._request("DELETE", f"/api/pulse/ml-models/{name}")
+        self._client._request("DELETE", f"/api/pulse/ml-models/{_encode_path_segment(name)}")
 
 
 def _require_nonblank_models(field: str, value: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
+
+
+def _read_uleb128(blob: bytes, pos: int) -> tuple[int, int]:
+    """Decode an unsigned LEB128 integer from ``blob`` at ``pos``.
+
+    Returns ``(value, next_pos)``. Raises ``ValueError`` on truncated input.
+    """
+    result = 0
+    shift = 0
+    while True:
+        if pos >= len(blob):
+            raise ValueError("malformed WASM module")
+        byte = blob[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("malformed WASM module")
+
+
+def _validate_wasm_module(blob: bytes) -> None:
+    """Client-side pre-upload validation of a WASM module's bytes.
+
+    Mirrors the server's ``ChicoryWasmRunner.validateModule`` checks so a
+    non-conforming module is rejected locally with a clear message, without an
+    HTTP round-trip. Inspects the binary; it does not execute it.
+
+    Raises:
+        ValueError: if the bytes are not a conforming sandbox module — too
+            short, bad magic/version, importing host functions, malformed, or
+            missing the required ``alloc`` / ``process`` / ``memory`` exports.
+    """
+    if not blob or len(blob) < 8:
+        raise ValueError("not a WASM module: too short")
+    if blob[0:4] != b"\x00asm" or blob[4:8] != b"\x01\x00\x00\x00":
+        raise ValueError("not a WASM module (bad magic/version)")
+
+    names: set[str] = set()
+    pos = 8
+    n = len(blob)
+    while pos < n:
+        section_id = blob[pos]
+        pos += 1
+        size, pos = _read_uleb128(blob, pos)
+        payload_end = pos + size
+        if payload_end > n:
+            raise ValueError("malformed WASM module")
+        if section_id == 2:  # imports
+            count, p = _read_uleb128(blob, pos)
+            if count > 0:
+                raise ValueError(
+                    "WASM module imports host functions; it must be a pure "
+                    "sandbox (build with no WASI/host imports)"
+                )
+        elif section_id == 7:  # exports
+            count, p = _read_uleb128(blob, pos)
+            for _ in range(count):
+                name_len, p = _read_uleb128(blob, p)
+                name_end = p + name_len
+                if name_end > payload_end:
+                    raise ValueError("malformed WASM module")
+                try:
+                    names.add(blob[p:name_end].decode("utf-8"))
+                except UnicodeDecodeError as exc:
+                    raise ValueError("malformed WASM module") from exc
+                p = name_end
+                if p >= payload_end:
+                    raise ValueError("malformed WASM module")
+                p += 1  # kind byte
+                _, p = _read_uleb128(blob, p)  # export index
+        pos = payload_end
+
+    required = {"alloc", "process", "memory"}
+    if not required.issubset(names):
+        raise ValueError("WASM module must export alloc, process and memory")
+
+
+class _WasmResource(_Resource):
+    """``client.wasm`` — B-110 sandboxed WASM module registry.
+
+    Upload WebAssembly modules that the streaming ``wasm`` operator runs over
+    events, sandboxed in pure-Java Chicory on the engine (no host syscalls).
+    Modules are org-scoped; upload / delete require the ADMIN role.
+
+    Example:
+        >>> client.wasm.upload(name="pii-redactor", path="./redactor.wasm")
+        >>> builder.from_topic("events").wasm(module="pii-redactor").to_topic("clean")
+    """
+
+    def upload(
+        self,
+        *,
+        name: str,
+        path: str | None = None,
+        data: bytes | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/pulse/wasm-modules — upload (or replace) a module.
+
+        Supply the module by file ``path`` or raw ``data`` bytes. The module is
+        validated (must parse, import no host functions, export
+        alloc/process/memory) before persisting. Replacing a name hot-swaps it
+        with no agent restart.
+
+        Args:
+            name: Module name referenced by ``wasm(module=...)``.
+            path: Filesystem path to the ``.wasm`` file.
+            data: Raw module bytes (alternative to ``path``).
+            description: Optional human-readable description.
+
+        Returns:
+            The persisted module metadata (name, sha256, version, …).
+        """
+        _require_nonblank_models("name", name)
+        if (path is None) == (data is None):
+            raise ValueError("provide exactly one of 'path' or 'data'")
+        if path is not None:
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            filename = path.rsplit("/", 1)[-1]
+        else:
+            blob = data  # type: ignore[assignment]
+            filename = f"{name}.wasm"
+        if not blob:
+            raise ValueError("module bytes are empty")
+        _validate_wasm_module(blob)
+        form: dict[str, Any] = {"name": name}
+        if description is not None:
+            form["description"] = description
+        files = {"module": (filename, blob, "application/wasm")}
+        return cast(
+            "dict[str, Any]",
+            self._client._request(
+                "POST", "/api/pulse/wasm-modules", files=files, data=form
+            ),
+        )
+
+    def list(self) -> list[dict[str, Any]]:
+        """GET /api/pulse/wasm-modules — modules registered for the caller's org."""
+        result = self._client._request("GET", "/api/pulse/wasm-modules")
+        if isinstance(result, dict):
+            modules = result.get("modules", [])
+            if isinstance(modules, list):
+                return cast("list[dict[str, Any]]", modules)
+        return []
+
+    def get(self, name: str) -> dict[str, Any]:
+        """GET /api/pulse/wasm-modules/{name} — metadata for one module."""
+        _require_nonblank_models("name", name)
+        return cast(
+            "dict[str, Any]",
+            self._client._request("GET", f"/api/pulse/wasm-modules/{_encode_path_segment(name)}"),
+        )
+
+    def delete(self, name: str) -> None:
+        """DELETE /api/pulse/wasm-modules/{name} — remove a module (ADMIN)."""
+        _require_nonblank_models("name", name)
+        self._client._request("DELETE", f"/api/pulse/wasm-modules/{_encode_path_segment(name)}")
 
 
 class _UsersResource(_Resource):
