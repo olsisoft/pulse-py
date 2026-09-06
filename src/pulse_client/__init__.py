@@ -26,6 +26,7 @@ from pulse_client.exceptions import (
     PulseRateLimitError,
     PulseValidationError,
 )
+from pulse_client.sql import compile_sql
 from pulse_client.streams import (
     StreamBuilder,
     StreamsResource,
@@ -34,7 +35,7 @@ from pulse_client.streams import (
     windows,
 )
 
-__version__ = "2.6.1"
+__version__ = "2.7.10"
 
 __all__ = [
     "PulseClient",
@@ -49,5 +50,6 @@ __all__ = [
     "WindowSpec",
     "aggs",
     "windows",
+    "compile_sql",
     "__version__",
 ]
