@@ -697,6 +697,51 @@ class StreamBuilder:
         self._operators.append(op)
         return self
 
+    def wasm(
+        self,
+        *,
+        module: str,
+        parallelism: int | None = None,
+        ordering: str | None = None,
+        on_failure: str | None = None,
+    ) -> StreamBuilder:
+        """B-110 — run a sandboxed WASM module over each event.
+
+        The uploaded module (see ``client.wasm.upload``) receives the event
+        payload bytes and returns the new payload (transform / map) or drops the
+        event (filter), running in pure-Java Chicory on the engine — no host
+        syscalls, bounded linear memory. Any ``wasm32`` toolchain (Rust, TinyGo,
+        AssemblyScript, C) can author a module against the alloc/process ABI.
+
+        Upload the module first with :meth:`WasmResource.upload`.
+
+        Args:
+            module: Registered module name (see ``client.wasm.upload``).
+            parallelism: max concurrent module invocations.
+            ordering: ``"PRESERVE_INPUT"`` (default) or ``"UNORDERED"``.
+            on_failure: ``"EMIT_ERROR"`` / ``"DROP"`` / ``"PASS_THROUGH"``.
+        """
+        _require_nonblank("module", module)
+        if ordering is not None and ordering not in ("PRESERVE_INPUT", "UNORDERED"):
+            raise ValueError(f"ordering must be PRESERVE_INPUT or UNORDERED, got {ordering!r}")
+        if on_failure is not None and on_failure not in (
+            "EMIT_ERROR",
+            "DROP",
+            "PASS_THROUGH",
+        ):
+            raise ValueError(
+                f"on_failure must be EMIT_ERROR, DROP, or PASS_THROUGH, got {on_failure!r}"
+            )
+        op: dict[str, Any] = {"type": "wasm", "module": module}
+        if parallelism is not None:
+            op["parallelism"] = parallelism
+        if ordering is not None:
+            op["ordering"] = ordering
+        if on_failure is not None:
+            op["onFailure"] = on_failure
+        self._operators.append(op)
+        return self
+
     def broadcast_join(
         self,
         *,
@@ -1023,6 +1068,18 @@ class StreamsResource:
         """Compile + POST to ``/api/pulse/pipelines``. Returns the server response."""
         definition = builder.build(name=name)
         return self._client.pipelines.create(definition)
+
+    def from_sql(self, sql: str, *, name: str | None = None) -> StreamBuilder:
+        """Compile a Streaming-SQL string into a :class:`StreamBuilder` (B-097).
+
+        A KSQL/Flink-SQL-flavoured subset (``SELECT ... FROM ... [WHERE]
+        [GROUP BY] [WINDOW] [HAVING] [INTO]``) compiled client-side. Deploy with
+        ``client.streams.deploy(client.streams.from_sql(sql, name=...))``. See
+        :func:`pulse_client.sql.compile_sql` for the supported grammar.
+        """
+        from pulse_client.sql import compile_sql
+
+        return compile_sql(sql, name=name)
 
 
 # ---------------------------------------------------------------------------
