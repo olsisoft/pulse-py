@@ -512,6 +512,36 @@ class TestStreamBuilderOperators:
                 model="m", input_fields=["x"], output_field="p", ordering="SHUFFLED"
             )
 
+    # ── B-110 wasm ────────────────────────────────────────────────
+
+    def test_wasm_full_shape(self) -> None:
+        b = (
+            StreamBuilder()
+            .from_topic("events")
+            .wasm(module="pii-redactor", parallelism=4, ordering="UNORDERED", on_failure="DROP")
+        )
+        assert b.operators() == [
+            {
+                "type": "wasm",
+                "module": "pii-redactor",
+                "parallelism": 4,
+                "ordering": "UNORDERED",
+                "onFailure": "DROP",
+            }
+        ]
+
+    def test_wasm_minimal_shape(self) -> None:
+        b = StreamBuilder().from_topic("in").wasm(module="m")
+        assert b.operators() == [{"type": "wasm", "module": "m"}]
+
+    def test_wasm_rejects_blank_module(self) -> None:
+        with pytest.raises(ValueError, match="module"):
+            StreamBuilder().from_topic("in").wasm(module="")
+
+    def test_wasm_rejects_bad_on_failure(self) -> None:
+        with pytest.raises(ValueError, match="on_failure"):
+            StreamBuilder().from_topic("in").wasm(module="m", on_failure="NOPE")
+
     def test_broadcast_join_full_shape(self) -> None:
         b = (
             StreamBuilder()
