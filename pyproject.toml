@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "streamflow-pulse-client"
-version = "2.6.1"
+version = "2.7.10"
 description = "Official Python client for StreamFlow Pulse — AI Agent Platform"
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,10 +48,14 @@ dev = [
     "mypy>=1.10",
 ]
 
+# Public, verifiable links ONLY (2026-08-13 credibility fix): the previous URLs
+# pointed at the private monorepo — a public 404 next to an Apache-2.0 badge,
+# which costs more trust than it buys. Source/Issues now point at the public
+# distribution satellite, where the published sources actually live.
 [project.urls]
-Homepage = "https://github.com/olsisoft/pulse-py"
-Documentation = "https://github.com/olsisoft/pulse-py/blob/main/README.md"
-Source = "https://github.com/olsisoft/pulse-py/tree/main"
+Homepage = "https://streamflowmesh.io"
+Documentation = "https://streamflowmesh.io"
+Source = "https://github.com/olsisoft/pulse-py"
 Issues = "https://github.com/olsisoft/pulse-py/issues"
 
 [tool.hatch.build.targets.wheel]
