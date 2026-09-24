@@ -64,7 +64,7 @@ for agent in client.agents.list():
 client.close()
 ```
 
-## Supported surfaces (v2.6.0)
+## Supported surfaces (v2.7.x)
 
 | Resource | Methods | Notes |
 |---|---|---|
@@ -91,6 +91,12 @@ builder.from_topic("transactions").ml_predict(
     model="fraud", input_fields=["amount", "country"], output_field="prediction"
 ).filter("prediction.fraud_score > 0.8").to_topic("flagged")
 
+# Upload + run a sandboxed WASM module over each event (B-110, pure-Java
+# Chicory on the engine — no host syscalls). Authored from any wasm32
+# toolchain (Rust, TinyGo, AssemblyScript, C).
+client.wasm.upload(name="pii-redactor", path="./redactor.wasm")
+builder.from_topic("events").wasm(module="pii-redactor").to_topic("clean")
+
 # Duplex: send in, receive the correlated output on one connection
 # (pip install streamflow-pulse-client[duplex])
 async with client.duplex("fraud-detector") as ch:
@@ -98,7 +104,40 @@ async with client.duplex("fraud-detector") as ch:
     signal = await ch.recv()        # signal["correlation_id"] == "tx-1"
 ```
 
+**Legacy formats & protocols — the headline use case.** Compile *any* existing
+parser to `wasm32` and drop it in as a single-message transform to bring legacy
+data into the pipeline — **COBOL copybooks**, FIX, HL7, EDI X12, ASN.1, Modbus, …
+You don't rewrite the parser, you wrap it (see the `pulse-wasm-guest` guest SDK for
+the Rust/TinyGo/AssemblyScript/C operator ABI). Pair it with `.ml_predict()` (ONNX
+above) to parse *and* score each event in-stream, with no external service.
+
 ## Authentication
+
+### Where credentials come from
+
+The SDK authenticates as a **Pulse user** — there are no separate API keys to
+provision. A username + password (or a JWT minted from them) is all you need,
+and they live in **your own Pulse instance**, not on streamflowmesh.io.
+
+1. **First run → bootstrap admin.** The very first account is created either by
+   the first-run screen of the Pulse web/desktop app, or by a single
+   *unauthenticated* `POST /api/auth/register` with a `{"username","password"}`
+   body **while no user exists yet**. That first user is granted **ADMIN**. As
+   soon as any user exists, `/api/auth/register` locks down and requires an admin
+   JWT — so the open bootstrap can only ever mint the very first account.
+2. **Additional users.** An admin creates more accounts from **Settings → Users**
+   in the Pulse UI (or an admin-authenticated `register` call). Give each CI job
+   or service integration its own dedicated user rather than sharing the admin.
+3. **Exchange for a token.** `login(username, password)` returns a short-lived
+   **access JWT** (~1 h TTL) plus a **refresh token**; the client caches the
+   access token automatically. In CI, either call `login` at startup, or pass a
+   pre-minted JWT (pattern 2 below) and refresh it before it expires.
+
+`base_url` / the first positional arg points at *your* Pulse server —
+`http://localhost:9090` for a local `pulse --headless` or desktop install, or
+your deployed Pulse URL.
+
+### Passing the token to the client
 
 Three patterns, pick what fits:
 
@@ -144,6 +183,39 @@ except PulseClientError as e:
 
 Every exception carries `.status_code`, `.path`, and `.body` so log lines + bug reports are actionable.
 
+## Automatic retry (opt-in)
+
+By default the client makes exactly one attempt per request and surfaces the
+typed error — retries are **off** so nothing is retried behind your back. Opt in
+with `max_retries`:
+
+```python
+client = PulseClient(
+    "http://localhost:9090",
+    token="ey...",
+    max_retries=3,                 # 0 = off (default)
+    retry_backoff=0.2,             # base seconds; full-jitter exponential backoff
+    retry_max_backoff=10.0,        # cap per attempt
+    retry_on_status=(502, 503, 504),
+    retry_idempotent_only=True,    # don't retry POST on 5xx (default)
+)
+```
+
+Policy:
+
+* **429 (rate limited)** is retried for **any** method (the request was rejected,
+  never processed) and honours `retryAfterSeconds` / the `Retry-After` header
+  before falling back to backoff;
+* `retry_on_status` 5xx and transport (connect/read) errors are retried only for
+  **idempotent** methods (GET/HEAD/PUT/DELETE) unless `retry_idempotent_only=False`
+  — so a POST create is never silently duplicated;
+* terminal 4xx (400/401/404) are never retried; retries are bounded by `max_retries`.
+
+> This opt-in retry policy currently ships in the **Python SDK** as the reference
+> implementation. Rolling the same policy out to the Rust / Go / JS / Java SDKs is
+> tracked as **B-170** (issue #312); those SDKs surface `retryAfter` on the
+> rate-limit error today so callers can retry manually.
+
 ## Development
 
 ```bash
@@ -162,6 +234,73 @@ mypy src
 ```
 
 CI runs the same on every push touching `pulse-py/` — see `.github/workflows/pulse-py.yaml`.
+
+## Local pipeline simulation (Python-exclusive)
+
+The streams DSL is **client-side declaration, server-side execution** — but the
+Python SDK additionally ships a local, in-process executor: the moral equivalent
+of Kafka Streams' `TopologyTestDriver`, with **no server and no JVM**. Run your
+pipeline over sample events to see what would reach the sink, before you deploy:
+
+```python
+from pulse_client.streams import StreamBuilder, windows, aggs
+
+builder = (
+    StreamBuilder("card-velocity-60s")
+    .from_topic("card-authorizations")
+    .key_by("cardId")
+    .window(windows.tumbling("60s"), aggregations={"txCount": aggs.count()})
+    .filter("txCount > 5")
+    .to_topic("fraud-alerts")
+)
+
+# Feed synthetic events through the SAME operator chain deploy() would POST:
+survivors = builder.simulate([
+    {"cardId": "card-7", "amount": 10, "_ts": 1_000},
+    # … more events in the same 60s window …
+    {"cardId": "card-7", "amount": 10, "_ts": 70_000},  # advances the watermark, closes the window
+])
+print(survivors)  # the window emissions that crossed txCount > 5
+```
+
+`simulate()` supports `filter` / `map` / `flat_map` / `key_by` / `window`
+(tumbling + global) and all 7 aggregators, with a safe `ast`-based expression
+evaluator (no `eval`). Engine-bound operators (`enrich`, `cep`, joins, LLM/MCP/ML)
+raise `NotImplementedError` — deploy server-side for those.
+
+> This is **unique to the Python SDK today**. The Rust / Go / JS / Java SDKs
+> declare client-side (`compile`) and execute server-side (`deploy`) but have no
+> in-process simulator. Cross-language parity is tracked as **B-169** (issue #311).
+
+## Streaming SQL (compile SQL → pipeline) — B-097
+
+Write a streaming pipeline as SQL; it compiles client-side to the same
+`StreamBuilder` pipeline (a KSQL/Flink-SQL-flavoured subset):
+
+```python
+from pulse_client import PulseClient, compile_sql
+
+builder = compile_sql(
+    """SELECT count(*) AS cnt, sum(amount) AS total
+       FROM payments
+       WHERE amount > 1000
+       GROUP BY customer_id
+       WINDOW TUMBLING(60s)
+       HAVING cnt > 5
+       INTO fraud-alerts""",
+    name="fraud-detector",
+)
+
+with PulseClient(url, token=jwt) as client:
+    client.streams.deploy(builder)          # or: client.streams.from_sql(sql, name=...)
+```
+
+Supported: `SELECT` aggregates (`count(*)`, `sum/avg/min/max(f)`,
+`distinct_count(f)`, `collect_list(f)`) with `AS` aliases, `*`, and plain-column
+projection (→ a `map`); `WHERE`/`HAVING` (SQL `=`/`<>`/`AND`/`OR` translated to
+`==`/`!=`/`&&`/`||`); `GROUP BY`; `WINDOW TUMBLING/SLIDING/SESSION/COUNT/GLOBAL`;
+`INTO`. Inspect the result with `builder.build()` or run it with
+`builder.simulate(events)` before deploying.
 
 ## Roadmap
 
