@@ -1,3 +1,5 @@
+# LEGACY_COMPATIBILITY: existing tagged SDK publisher; PE1 does not invoke it.
+# Canonical implementation/mirror authority is olsisoft/pulse; live tags unchanged.
 name: Release to PyPI
 
 # Lives at .github/workflows/release.yaml in olsisoft/pulse-py.

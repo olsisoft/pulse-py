@@ -32,3 +32,6 @@ env/
 # mypy / ruff caches
 .mypy_cache/
 .ruff_cache/
+
+# Explicit local packaged public API fixtures
+.pulse-public-resources/

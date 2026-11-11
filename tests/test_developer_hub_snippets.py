@@ -22,6 +22,9 @@ DSL-shape risk doesn't live there.
 from __future__ import annotations
 
 import ast
+import os
+import json
+import hashlib
 import re
 from pathlib import Path
 from unittest import mock
@@ -30,15 +33,19 @@ import pytest
 
 from pulse_client import PulseClient, StreamBuilder, WindowSpec, aggs, windows  # noqa: F401
 
-# Repo-relative location of the JAR-bundled Developer Hub Markdown.
-_DOCS_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "streamflow-pulse"
-    / "src"
-    / "main"
-    / "resources"
-    / "developer-hub"
-)
+# Public resources are extracted from the qualified packaged product, never a checkout.
+_fixture_value = os.environ.get("PULSE_PUBLIC_RESOURCE_FIXTURE")
+if not _fixture_value:
+    raise RuntimeError("PULSE_PUBLIC_RESOURCE_FIXTURE required; run tools/prepare-public-resources.py")
+_fixture = Path(_fixture_value).resolve()
+_manifest = json.loads((_fixture / "manifest.json").read_text(encoding="utf-8"))
+if _manifest.get("source_repository") != "olsisoft/pulse" or not _manifest.get("resources"):
+    raise RuntimeError("Canonical Pulse public fixture manifest required")
+for _record in _manifest["resources"]:
+    _file = (_fixture / _record["path"]).resolve()
+    if not _file.is_relative_to(_fixture) or hashlib.sha256(_file.read_bytes()).hexdigest() != _record["sha256"]:
+        raise RuntimeError("Canonical public fixture digest mismatch")
+_DOCS_DIR = _fixture / "developer-hub"
 
 _PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 
@@ -46,7 +53,7 @@ _PYTHON_BLOCK = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
 def _python_snippets() -> list[tuple[str, int, str]]:
     """(filename, 1-based block index, code) for every python fence."""
     if not _DOCS_DIR.is_dir():
-        pytest.skip(f"developer-hub docs not found at {_DOCS_DIR}", allow_module_level=True)
+        raise RuntimeError(f"canonical packaged developer-hub docs not found at {_DOCS_DIR}")
     out: list[tuple[str, int, str]] = []
     for md in sorted(_DOCS_DIR.glob("*.md")):
         for i, m in enumerate(_PYTHON_BLOCK.finditer(md.read_text(encoding="utf-8")), 1):

@@ -1,6 +1,6 @@
 # streamflow-pulse-client — Python SDK for StreamFlow Pulse
 
-Official Python client for the [Pulse](https://github.com/olsisoft/pulse-py) AI Agent Platform.
+Official Python client for the [Pulse](https://github.com/olsisoft/pulse) AI Agent Platform.
 
 **Distribution name** on PyPI is `streamflow-pulse-client`; **import statement** stays the natural `from pulse_client import ...` (same convention as `python-dateutil` → `import dateutil`).
 
@@ -25,7 +25,7 @@ Requires Python **3.10+**. Pure Python — only depends on `httpx`.
 
 - **Pythonic** — context-manager friendly, typed exceptions, attribute-style resource access (`client.pipelines.list()`).
 - **Lightweight** — single dependency (`httpx`), <500 LoC, no generated bloat.
-- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](../streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift is caught at PR time by the in-tree spec invariant tests (B-103).
+- **Spec-aligned** — every method corresponds 1:1 to an endpoint in the [Pulse OpenAPI 3.1 spec](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/openapi/openapi.yaml). Drift is caught at PR time by the in-tree spec invariant tests (B-103).
 - **Async-ready** — the sync client ships today; an `AsyncPulseClient` (same surface, `await` everywhere) will follow in v3.0.
 
 ## Quick start
@@ -81,7 +81,7 @@ The full ~112-endpoint surface (admin, audit, backups, chat, workspace, etc.) is
 
 Score events with an uploaded ONNX model in-process (B-112), and open a
 bidirectional duplex channel for synchronous decisions (B-114). Full guide:
-[ML inference & duplex](https://github.com/olsisoft/pulse-py/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+[ML inference & duplex](https://github.com/olsisoft/pulse/blob/main/streamflow-pulse/src/main/resources/developer-hub/sdk-reference.md).
 
 ```python
 # Upload + score with an ONNX model (no model-server hop)
@@ -307,10 +307,32 @@ projection (→ a `map`); `WHERE`/`HAVING` (SQL `=`/`<>`/`AND`/`OR` translated t
 - **v2.5.x** — current sync API, 5 core resources (auth, pipelines, agents, templates, users), `version()`.
 - **v2.6.x** — expanded resource coverage: backups, schedules, credentials, settings, approvals, chat.
 - **v3.0** — `AsyncPulseClient` with `async def` everywhere; same surface; one library, two clients.
-- **B-098 satellite** — once `olsisoft/pulse-py` exists as its own repo, this in-tree code lifts out wholesale. Pip-install will switch to the satellite; in-tree continues to mirror for one release cycle so the migration is non-breaking.
+- **Historical B-098 satellite (LEGACY_COMPATIBILITY)** — once `olsisoft/pulse-py` exists as its own repo, this in-tree code lifts out wholesale. Pip-install will switch to the satellite; in-tree continues to mirror for one release cycle so the migration is non-breaking.
 
 Track progress in [`docs/STREAMFLOW-BACKLOG.md`](../docs/STREAMFLOW-BACKLOG.md) under item **B-098**.
 
 ## License
 
 Apache 2.0 — same as the parent Pulse repository.
+
+## Canonical source and local qualification
+
+Canonical implementation: [olsisoft/pulse](https://github.com/olsisoft/pulse),
+not historical StreamFlow source. Existing public package identities, release
+URLs and protocol endpoints remain unchanged. Published installations/channels are
+LEGACY_COMPATIBILITY; PE1 qualifies only explicit local/private candidate artifacts.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Developer-hub parity tests require public fixtures from the actual qualified Pulse
+product JAR, with no sibling checkout or skip fallback:
+
+```sh
+python tools/prepare-public-resources.py --product-jar /path/to/product.jar \
+  --sha256 <qualified-jar-sha256> --source-head <candidate-head> \
+  --source-tree <candidate-tree> --output .pulse-public-resources
+export PULSE_PUBLIC_RESOURCE_FIXTURE="$PWD/.pulse-public-resources"
+```
+
+Run the existing SDK test command after preparation. Missing, tampered or empty
+fixtures fail closed. The expected HEAD/tree and JAR digest come from the new
+qualified candidate receipt, not an assumed baseline or a published registry tag.

@@ -1,8 +1,12 @@
 # Contributing to pulse-py
 
-This repository is **a synchronised mirror** of `pulse-py/` in the
-[streamflow monorepo](https://github.com/olsisoft/pulse-py).
+The canonical source of this SDK is `pulse-py/` in
+[olsisoft/pulse](https://github.com/olsisoft/pulse/tree/main/pulse-py).
+Historical StreamFlow copies are legacy compatibility material, not a mirror
+authority. Submit implementation changes against canonical Pulse. The mirror
+producer is owned by Pulse; this candidate does not run synchronization or release
+publishers and does not change existing SDK coordinates, tags or runtime protocol.
 
-Open issues + pull requests against the monorepo, not against this
-repo. The sync workflow lifts code from there into here on every
-streamflow `dev` push that touches `pulse-py/`.
+The satellite remains a public distribution/client repository. Its existing tagged
+release workflow and published package versions are **LEGACY_COMPATIBILITY** until
+a separate publication/activation decision. No new public Pulse release is implied.
